@@ -1,5 +1,8 @@
 *.tfstate
 *.backup
+*.bak
 .terraform.lock.hcl
 .terraform/
 kubeconfig-todo
+todo-key.pem
+.python-version

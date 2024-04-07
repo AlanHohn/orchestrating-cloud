@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+
+Parameters:
+  AMI:
+    Type: AWS::EC2::Image::Id
+    Default: ami-051f8a213df8bc089
+    Description: AMI for Web App EC2 Instance
+
+Mappings:
+  Zones:
+    a: 
+      Cidr: "10.0.1.0/24"
+    b: 
+      Cidr: "10.0.2.0/24"
+    c: 
+      Cidr: "10.0.3.0/24"
+
+Outputs:
+  TodoInstance:
+    Description: ID for Todo EC2 Instance
+    Value: !Ref TodoInstance
+  TodoIp:
+    Description: Public IP for Todo Instance
+    Value: !GetAtt TodoInstance.PublicIp
+
+Resources:
+  TodoInternetGateway:
+    Type: AWS::EC2::InternetGateway
+  
+  TodoVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags: 
+        - Key: Application
+          Value: Todo
+
+  TodoVpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref TodoInternetGateway
+      VpcId: !Ref TodoVpc
+
+  TodoRouteTable:
+    Type:  AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TodoVpc 
+
+  TodoInternetRoute:
+    Type: AWS::EC2::Route
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref TodoInternetGateway
+      RouteTableId: !Ref TodoRouteTable
+
+  'Fn::ForEach::Subnets':
+    - SubnetIdentifier
+    - - a
+      - b
+      - c
+    - "TodoSubnet${SubnetIdentifier}":
+        Type: AWS::EC2::Subnet
+        Properties:
+          VpcId: !Ref TodoVpc
+          AvailabilityZone: !Sub '${AWS::Region}${SubnetIdentifier}'
+          CidrBlock: !FindInMap
+            - Zones
+            - !Ref SubnetIdentifier
+            - Cidr
+
+  'Fn::ForEach::SubnetRouteTables':
+    - SubnetIdentifier
+    - - a
+      - b
+      - c
+    - "TodoSubnetRoute${SubnetIdentifier}":
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+          RouteTableId: !Ref TodoRouteTable
+          SubnetId: !Ref 
+            'Fn::Sub': 'TodoSubnet${SubnetIdentifier}'
+
+  TodoDbAuth:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+    # Demo application, so clean up fully
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  TodoDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet Group for TodoDb
+      DBSubnetGroupName: TodoDbSubnetGroup
+      SubnetIds:
+        - !Ref TodoSubneta
+        - !Ref TodoSubnetb
+        - !Ref TodoSubnetc
+
+  TodoDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Database Connections from within VPC 
+      VpcId: !Ref TodoVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: "10.0.0.0/16"
+
+  TodoDbParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: Todo Db Parameters
+      Family: postgres15
+      Parameters:
+        rds.force_ssl: 0
+
+  TodoDb:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      AllocatedStorage: 100
+      AvailabilityZones:
+        - !Sub '${AWS::Region}a'
+        - !Sub '${AWS::Region}b'
+        - !Sub '${AWS::Region}c'
+      BackupRetentionPeriod: 1
+      DatabaseName: todo
+      DBClusterIdentifier: todo
+      DBClusterInstanceClass: db.c6gd.medium
+      DBClusterParameterGroupName: !Ref TodoDbParameterGroup
+      DBSubnetGroupName: !Ref TodoDbSubnetGroup
+      Engine: postgres
+      EngineVersion: "15"
+      Iops: 1000
+      MasterUsername: todo
+      MasterUserPassword: !Sub 
+        - '{{resolve:secretsmanager:${Auth}:SecretString:password}}'
+        - Auth: !Ref TodoDbAuth
+      Port: 5432
+      StorageType: io1
+      VpcSecurityGroupIds:
+        - !Ref TodoDbSecurityGroup
+    # Demo application, so clean up fully
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  TodoSecurityRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal: 
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref TodoDbAuth
+
+  TodoInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref TodoSecurityRole
+
+  TodoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Connections to Web App 
+      VpcId: !Ref TodoVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+
+  TodoSshKey:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: TodoKey
+
+  TodoInstance: 
+    Type: AWS::EC2::Instance
+    Properties: 
+      IamInstanceProfile: !Ref TodoInstanceProfile
+      ImageId: !Ref AMI
+      InstanceType: t3a.small
+      KeyName: !Ref TodoSshKey
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - !Ref TodoSecurityGroup
+          SubnetId: !Ref TodoSubneta
+      UserData: 
+        Fn::Base64: !Sub 
+        - |
+          #!/bin/bash -e
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo BEGIN
+          date '+%Y-%m-%d %H:%M:%S'
+          echo 'Installing Node and PM2'
+          yum install -y gcc-c++ make
+          curl -sL https://rpm.nodesource.com/setup_16.x | sudo -E bash -
+          yum install -y nodejs git
+          npm install -g pm2
+          echo 'Adding Todo user and directory'
+          adduser --system --no-create-home -d /opt/todo -s /sbin/nologin todo
+          mkdir -p /opt/todo /var/todo
+          echo 'Fetching database authentication'
+          aws secretsmanager get-secret-value --secret-id ${TodoDbAuth} \
+            --query SecretString --output text | jq -r .password \
+            >/var/todo/auth.txt
+          chmod 0700 /var/todo
+          chmod 0600 /var/todo/auth.txt
+          chown -R todo:todo /opt/todo /var/todo
+
+          echo 'Initializing todo application'
+          sudo -u todo bash -e << EOF
+          cd /opt/todo
+          git clone https://github.com/book-of-kubernetes/todo.git .
+          npm install
+          npm run grunt
+          cat >ecosystem.config.js << EOD
+          module.exports = {
+            apps : [
+              {
+                name: "todo",
+                script: "npm",
+                args: "start",
+                env: {
+                  "NODE_ENV": "production",
+                  "PREFIX": "/",
+                  "PGHOST": "${TodoDatabaseHost}",
+                  "PGDATABASE": "todo",
+                  "PGUSER": "todo"
+                }
+              }
+            ]
+          }
+          EOD
+          export PGPASSWORD="`cat /var/todo/auth.txt`"
+          pm2 start ecosystem.config.js
+          EOF
+          echo END
+          date '+%Y-%m-%d %H:%M:%S'
+        - TodoDbAuth: !Ref TodoDbAuth
+          TodoDatabaseHost: !GetAtt TodoDb.Endpoint.Address
+    # Demo application, so clean up fully
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
